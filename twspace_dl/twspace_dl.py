@@ -5,7 +5,7 @@ import shutil
 import subprocess
 import tempfile
 from functools import cached_property
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from mutagen.mp4 import MP4, MP4Cover
 
@@ -59,8 +59,29 @@ class TwspaceDL:
         return master_url
 
     @property
+    def is_video_space(self) -> bool:
+        """Whether the Space has video.
+
+        Audio Spaces resolve to `.../audio-space/playlist_<n>.m3u8`. Video Spaces
+        resolve to `.../master_dynamic_<n>.m3u8`, which lists video renditions only.
+        """
+        return "/audio-space/" not in self.dyn_url
+
+    @cached_property
     def playlist_url(self) -> str:
         """Get the URL containing the chunks filenames"""
+        if self.is_video_space:
+            # Take the smallest rendition: only the audio track is kept.
+            lines = API.client.get(self.dyn_url).text.splitlines()
+            renditions = [
+                (int(match.group(1)), lines[i + 1])
+                for i, line in enumerate(lines[:-1])
+                if line.startswith("#EXT-X-STREAM-INF")
+                and (match := re.search(r"BANDWIDTH=(\d+)", line))
+            ]
+            if not renditions:
+                raise RuntimeError(f"No renditions in playlist: {self.dyn_url}")
+            return urljoin(self.dyn_url, min(renditions)[1])
         response = API.client.get(self.master_url)
         playlist_suffix = response.text.splitlines()[3]
         domain = urlparse(self.master_url).netloc
@@ -71,6 +92,17 @@ class TwspaceDL:
     def playlist_text(self) -> str:
         """Modify the chunks URL using the master one to be able to download"""
         playlist_text = API.client.get(self.playlist_url).text
+        if self.is_video_space:
+            # Video chunks sit next to the rendition playlist.
+            return "\n".join(
+                (
+                    line
+                    if not line or line.startswith("#")
+                    else urljoin(self.playlist_url, line)
+                )
+                for line in playlist_text.splitlines()
+            )
+        # Audio chunks sit next to the master playlist, not the rendition playlist.
         master_url_wo_file = re.sub(r"master_playlist\.m3u8.*", "", self.master_url)
         playlist_text = re.sub(r"(?=chunk)", master_url_wo_file, playlist_text)
         return playlist_text
@@ -108,6 +140,8 @@ class TwspaceDL:
             "-metadata",
             f"episode_id={space['id']}",
         ]
+        if self.is_video_space:
+            cmd_base.append("-vn")
 
         filename = os.path.basename(self.filename)
         filename_m3u8 = os.path.join(self._tempdir, filename + ".m3u8")
