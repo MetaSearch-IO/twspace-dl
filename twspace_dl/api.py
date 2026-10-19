@@ -317,8 +317,30 @@ class FleetsAPI(APIClient):
         return self.get(version, endpoint, params)
 
 
+def http_status(error: BaseException | None) -> int | None:
+    """Walk the exception chain and return the first HTTP status code found.
+
+    `HTTPClient.get()` wraps `HTTPError` in `RuntimeError`, so the status is one or
+    more `__cause__` levels down.
+    """
+    while error is not None:
+        if isinstance(error, HTTPError) and error.response is not None:
+            return error.response.status_code
+        error = error.__cause__
+    return None
+
+
 class LiveVideoStreamAPI(APIClient):
-    """Twitter Live Video Stream API client."""
+    """Twitter Live Video Stream API client.
+
+    The stream status is requested as a logged-out guest, not with the cookies. X
+    answers this endpoint with a bare 404 for accounts it marks inactive (error 141
+    "You are not currently active" on logged-in endpoints), while a guest gets the
+    same playlist the web player uses.
+    """
+
+    """URL to activate a guest token."""
+    _GUEST_ACTIVATE_URL = "https://api.x.com/1.1/guest/activate.json"
 
     def __init__(self, client: HTTPClient, path: str, cookies: dict[str, str]) -> None:
         """Initialize the Twitter Live Video Stream API client.
@@ -328,15 +350,50 @@ class LiveVideoStreamAPI(APIClient):
         - cookies: The cookies used for making all requests to the API.
         """
         super().__init__(client, path, cookies)
+        self._guest_token: str | None = None
+
+    def _activate_guest_token(self) -> str:
+        """Request a new guest token.
+
+        - return: The guest token.
+        """
+        response = self.client.session.post(
+            self._GUEST_ACTIVATE_URL,
+            headers={
+                "authorization": TWITTER_AUTHORIZATION,
+                "User-Agent": self.headers["User-Agent"],
+            },
+            timeout=TIMEOUT,
+        )
+        response.raise_for_status()
+        return response.json()["guest_token"]
 
     def status(self, media_key: str) -> dict:
         """Retrieve Twitter Space media playlist details by the specified media key.
+
+        The guest token is reused across calls and renewed once when X rejects it
+        (401/403).
 
         - media_key: The media key of the Twitter Space.
 
         - return: The media playlist details of the specified media key.
         """
-        return super().get(self.join_url("status", media_key))
+        url = self.join_url(self.base_url, "status", media_key)
+        for attempt in range(2):
+            if self._guest_token is None or attempt > 0:
+                self._guest_token = self._activate_guest_token()
+            headers = {
+                "authorization": TWITTER_AUTHORIZATION,
+                "x-guest-token": self._guest_token,
+                "User-Agent": self.headers["User-Agent"],
+            }
+            try:
+                return self.client.get(url, headers=headers).json()
+            except RuntimeError as err:
+                if attempt == 0 and http_status(err) in (401, 403):
+                    continue
+                raise
+        raise AssertionError("unreachable")
 
 
 class DummyAPI:
